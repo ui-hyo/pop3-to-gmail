@@ -1,0 +1,17 @@
+[Unit]
+Description=Copy POP3 mail into Gmail
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/email2gmail
+ExecStart=/usr/bin/env python3 -m email2gmail.cli once
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+TimeoutStartSec=10min
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.local/state/email2gmail %h/.config/gws

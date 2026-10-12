@@ -1,0 +1,11 @@
+[Unit]
+Description=Check mail-sync freshness every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+AccuracySec=5
+Unit=email2gmail-watchdog.service
+
+[Install]
+WantedBy=timers.target

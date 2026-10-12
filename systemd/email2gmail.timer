@@ -1,0 +1,12 @@
+[Unit]
+Description=Check POP3 mail every two minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/2:00
+Persistent=true
+RandomizedDelaySec=5
+AccuracySec=5
+Unit=email2gmail.service
+
+[Install]
+WantedBy=timers.target

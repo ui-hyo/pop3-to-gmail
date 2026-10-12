@@ -1,0 +1,26 @@
+# Copy to ~/.config/email2gmail/config.toml and chmod 600. Keep it outside the repository.
+gmail_account = "you@gmail.com"
+# POP3 login name. It must equal EMAIL2GMAIL_POP_USER in credentials_file.
+pop_account = "you@example.com"
+pop_host = "pop.example.com"
+pop_port = 995
+# KEY=value file holding EMAIL2GMAIL_POP_USER and EMAIL2GMAIL_POP_PASSWORD.
+credentials_file = "~/.config/email2gmail/secrets.env"
+# KEY=value file holding EMAIL2GMAIL_TELEGRAM_TOKEN (may be the same file).
+telegram_file = "~/.config/email2gmail/secrets.env"
+# Numeric chat ID as a quoted string. The bot sends notices only to this chat.
+telegram_chat_id = "123456789"
+state_dir = "~/.local/state/email2gmail/runtime"
+# An absolute path is safer under systemd than relying on PATH.
+gws_bin = "/usr/local/bin/gws"
+gmail_label = "Email2Gmail"
+initial_days = 30
+max_messages = 25
+summary_seconds = 1800
+heartbeat_seconds = 21600
+stale_seconds = 900
+
+# Enable only after reviewing `cleanup` preview and approving source deletion.
+source_cleanup_enabled = false
+source_retention_days = 7
+cleanup_interval_seconds = 3600
