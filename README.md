@@ -57,6 +57,7 @@ a duplicate or a missing message. The tool is built around that problem:
 3. Create the config directory, copy the example, fill it in and restrict it:
 
    ```bash
+   cd ~/email2gmail
    mkdir -p ~/.config/email2gmail
    cp config.example.toml ~/.config/email2gmail/config.toml
    chmod 600 ~/.config/email2gmail/config.toml
