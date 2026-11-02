@@ -115,6 +115,7 @@ the first listing, so changing the value afterwards does not re-import older mai
 | `status` | Local state as JSON. No network access. |
 | `health` | Read-only verdict for monitoring. Exit code 0 when healthy, 1 otherwise. |
 | `ignore <ref>` | Acknowledge one reviewed `blocked` message. Source mail and spool are kept. |
+| `requeue [<ref> --token T --apply]` | Preview, then requeue one reviewed `gmail_search_limit` block. Never resends an attempted import. |
 | `watchdog` | Independent stale-run check that alerts through Telegram. |
 | `cleanup [--apply]` | Preview source-deletion candidates. `--apply` deletes them. |
 
@@ -124,6 +125,27 @@ something was delivered, a heartbeat every 6 hours and an alert at most once an 
 
 Stopping the timers does not interrupt a run that is already in progress. Killing the service
 mid-upload can leave an import in the `importing` state, so let it finish first.
+
+### Requeue after a search limit
+
+A message is `blocked` with error `gmail_search_limit` when the Gmail search for an earlier copy
+returns more than one page of results. Running out of the per-run Gmail time budget does not block
+mail; the search is simply retried on the next run. After checking in Gmail whether the message
+arrived, requeue it one item at a time:
+
+```bash
+python3 -m email2gmail.cli requeue                                  # read-only preview
+python3 -m email2gmail.cli requeue <ref> --token <token> --apply
+```
+
+The preview lists each item's `ref`, `attempts`, proposed `action` and `token`. An item that was
+never sent (`attempts=0`) returns to `prepared` only if its spool still matches the recorded hash,
+and Gmail is searched again before any import. An item that was sent before (`attempts>0`) may
+already be in Gmail, so it only resumes the search as `importing` and is never resent because the
+search found nothing. A missing or changed spool shows as `not_eligible` and is left alone. The
+token is checked again under the sync lock against the current state and each apply is recorded
+in an immutable `requeue_history` table. If the same item is blocked again, the preview issues a
+new token and the old one is refused.
 
 ## Message states
 

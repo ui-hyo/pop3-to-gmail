@@ -174,6 +174,14 @@ class State:
             marker TEXT, gmail_id TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
             next_try REAL NOT NULL DEFAULT 0, delivered_at REAL, present INTEGER NOT NULL DEFAULT 1
           );
+          CREATE TABLE IF NOT EXISTS requeue_history(
+            token TEXT PRIMARY KEY, uid TEXT NOT NULL, from_status TEXT NOT NULL, from_error TEXT,
+            attempts INTEGER NOT NULL, to_status TEXT NOT NULL, requeued_at REAL NOT NULL
+          );
+          CREATE TRIGGER IF NOT EXISTS requeue_history_no_update
+            BEFORE UPDATE ON requeue_history BEGIN SELECT RAISE(ABORT, 'immutable_requeue_history'); END;
+          CREATE TRIGGER IF NOT EXISTS requeue_history_no_delete
+            BEFORE DELETE ON requeue_history BEGIN SELECT RAISE(ABORT, 'immutable_requeue_history'); END;
         ''')
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(messages)')}
         for name, kind in [('cleanup_state', 'TEXT'), ('source_deleted_at', 'REAL'),
@@ -205,6 +213,9 @@ class State:
 
     def row(self, uid):
         return self.db.execute('SELECT * FROM messages WHERE uid=?', (uid,)).fetchone()
+
+    def has_table(self, name):
+        return self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
     def snapshot(self, listing, cfg, now):
         first = self.get('initial_cutoff') is None

@@ -6,12 +6,14 @@ under the real per-call timeout (``gmail_timeout``, 120 s).
 import base64
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from email2gmail.core import Gmail, headers, message_id, sync
+from email2gmail.cli import requeue_blocked
+from email2gmail.core import BridgeError, Gmail, GmailError, digest, headers, message_id, recover, sync
 import test_bridge
 from test_bridge import Source, mail
 
@@ -128,6 +130,141 @@ class GmailBudgetTests(unittest.TestCase):
         self.run_cycle(backend, Source({'u1': mail(body='new')}), 0)
         row = self.state.row('u1')
         self.assertEqual((row['status'], row['error'], backend.imports), ('blocked', 'gmail_search_limit', 0))
+
+
+
+class RequeueTests(unittest.TestCase):
+    """Operator-reviewed requeue of gmail_search_limit blocks."""
+    setUp = test_bridge.BridgeTests.setUp
+    tearDown = test_bridge.BridgeTests.tearDown
+    run_cycle = GmailBudgetTests.run_cycle
+
+    def blocked_unsent(self, uid='u1', raw=None):
+        raw = raw or mail()
+        with patch.object(self.gmail, 'find_match', side_effect=BridgeError('gmail_search_limit')):
+            sync(self.cfg, self.state, self.gmail, Source({uid: raw}), self.now)
+        self.assertEqual((self.state.row(uid)['status'], self.state.row(uid)['attempts']), ('blocked', 0))
+        return raw
+
+    def blocked_after_ambiguous_import(self):
+        raw = mail('two@example.com')
+        self.gmail.fail = GmailError('gmail_timeout')       # accepted, reply lost
+        sync(self.cfg, self.state, self.gmail, Source({'u2': raw}), self.now)
+        self.gmail.fail = None
+        with patch.object(self.gmail, 'find_match', side_effect=BridgeError('gmail_search_limit')):
+            recover(self.cfg, self.state, self.gmail, self.now+121)
+        self.assertEqual((self.state.row('u2')['status'], self.state.row('u2')['attempts']), ('blocked', 1))
+        return raw
+
+    def oversized_search_backend(self):
+        backend = GwsBackend(self.cfg)
+        for i in range(26):          # same Message-ID, other content: more than one result page
+            backend.add('other%02d' % i, mail(body='different %d' % i))
+        return backend
+
+    def preview(self, ref=None):
+        return requeue_blocked(self.cfg, ref)
+
+    def apply(self, uid):
+        ref = digest(uid.encode())[:16]
+        token = {m['ref']: m['token'] for m in self.preview()['messages']}[ref]
+        return requeue_blocked(self.cfg, ref, token, apply=True)
+
+    def test_preview_is_read_only_and_proposes_safe_actions(self):
+        self.blocked_unsent()
+        self.blocked_after_ambiguous_import()
+        before = (self.cfg.state/'state.sqlite3').read_bytes()
+        report = self.preview()
+        self.assertEqual((self.cfg.state/'state.sqlite3').read_bytes(), before)
+        actions = {m['ref']: m['action'] for m in report['messages']}
+        self.assertEqual(actions, {digest(b'u1')[:16]: 'prepared', digest(b'u2')[:16]: 'importing'})
+        self.assertNotIn('u1', json.dumps(report))
+
+    def test_preview_of_unmigrated_database_does_not_create_history(self):
+        self.blocked_unsent()
+        self.state.db.execute('DROP TABLE requeue_history')
+        self.state.db.commit()
+        self.assertEqual(self.preview()['messages'][0]['action'], 'prepared')
+        self.assertFalse(self.state.has_table('requeue_history'))
+
+    def test_unsent_item_returns_to_prepared_and_is_delivered_once(self):
+        self.blocked_unsent()
+        self.assertEqual(self.apply('u1')['status'], 'prepared')
+        sync(self.cfg, self.state, self.gmail, Source({'u1': mail()}), self.now+121)
+        self.assertEqual(self.state.row('u1')['status'], 'imported')
+        self.assertEqual(len(self.gmail.imports), 1)
+        history = self.state.db.execute('SELECT * FROM requeue_history').fetchall()
+        self.assertEqual([(h['from_status'], h['from_error'], h['to_status']) for h in history],
+                         [('blocked', 'gmail_search_limit', 'prepared')])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.state.db.execute('DELETE FROM requeue_history')
+        self.state.db.rollback()
+
+    def test_attempted_item_only_resumes_search_and_never_resends(self):
+        self.blocked_after_ambiguous_import()
+        self.assertEqual(self.apply('u2')['status'], 'importing')
+        self.gmail.visible = False                       # landed copy not searchable yet
+        for i in range(1, 4):
+            sync(self.cfg, self.state, self.gmail, Source({'u2': mail('two@example.com')}), self.now+121*(i+1))
+            self.assertEqual(self.state.row('u2')['status'], 'importing')
+        self.assertEqual(len(self.gmail.imports), 1)
+        self.gmail.visible = True
+        sync(self.cfg, self.state, self.gmail, Source({'u2': mail('two@example.com')}), self.now+121*6)
+        self.assertEqual(self.state.row('u2')['status'], 'imported')
+        self.assertEqual(len(self.gmail.imports), 1)
+
+    def test_tampered_payload_changed_state_and_other_blocks_are_refused(self):
+        self.blocked_unsent()
+        ref = digest(b'u1')[:16]
+        token = self.preview()['messages'][0]['token']
+        self.state.spool('u1').write_bytes(b'tampered')
+        self.assertEqual(self.preview()['messages'][0]['action'], 'not_eligible')
+        with self.assertRaisesRegex(BridgeError, 'requeue_not_eligible'):
+            requeue_blocked(self.cfg, ref, token, apply=True)
+        self.state.update('u1', error='message_too_large')
+        with self.assertRaisesRegex(BridgeError, 'requeue_candidate_not_found'):
+            requeue_blocked(self.cfg, ref, token, apply=True)
+        with self.assertRaisesRegex(BridgeError, 'requeue_confirmation_required'):
+            requeue_blocked(self.cfg, ref, apply=True)
+        self.assertEqual(self.state.row('u1')['status'], 'blocked')
+
+    def test_stale_token_is_refused(self):
+        self.blocked_after_ambiguous_import()
+        ref = digest(b'u2')[:16]
+        token = self.preview()['messages'][0]['token']
+        self.state.update('u2', attempts=2)
+        with self.assertRaisesRegex(BridgeError, 'requeue_exception_changed'):
+            requeue_blocked(self.cfg, ref, token, apply=True)
+        self.assertEqual(self.state.row('u2')['status'], 'blocked')
+
+    def test_same_unsent_item_can_be_requeued_after_second_search_limit_block(self):
+        backend = self.oversized_search_backend()
+        source = Source({'review': mail(body='desired payload')})
+        self.run_cycle(backend, source, 0)
+        self.assertEqual((self.state.row('review')['status'], backend.imports), ('blocked', 0))
+        first = self.preview()['messages'][0]
+        self.assertEqual(self.apply('review')['status'], 'prepared')
+        self.run_cycle(backend, source, 121)
+        self.assertEqual((self.state.row('review')['status'], backend.imports), ('blocked', 0))
+        backend.messages.clear()            # the operator resolves the oversized search
+        second = self.preview()['messages'][0]
+        self.assertNotEqual(second['token'], first['token'])   # a new recovery incident
+        requeue_blocked(self.cfg, second['ref'], second['token'], apply=True)
+        self.run_cycle(backend, source, 242)
+        self.assertEqual((self.state.row('review')['status'], backend.imports), ('imported', 1))
+        history = self.state.db.execute('SELECT to_status FROM requeue_history').fetchall()
+        self.assertEqual([h[0] for h in history], ['prepared', 'prepared'])
+
+    def test_previous_token_cannot_apply_to_a_new_incident(self):
+        backend = self.oversized_search_backend()
+        source = Source({'review': mail(body='desired payload')})
+        self.run_cycle(backend, source, 0)
+        first = self.preview()['messages'][0]
+        requeue_blocked(self.cfg, first['ref'], first['token'], apply=True)
+        self.run_cycle(backend, source, 121)
+        with self.assertRaisesRegex(BridgeError, 'requeue_exception_changed'):
+            requeue_blocked(self.cfg, first['ref'], first['token'], apply=True)
+        self.assertEqual(self.state.row('review')['status'], 'blocked')
 
 
 if __name__ == '__main__':

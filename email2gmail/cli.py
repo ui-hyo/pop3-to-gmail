@@ -145,6 +145,93 @@ def ignore_message(cfg, ref):
             state.close()
 
 
+def requeue_plan(state, row):
+    """Safe next status for a gmail_search_limit block, or None.
+
+    attempts=0 means no import was ever sent (intent is committed before the
+    call), so a hash-verified payload may wait again as prepared: deliver always
+    searches Gmail before importing.  attempts>0 may have landed in Gmail, so it
+    only resumes reconciliation as importing, which never resends.
+    """
+    if row['attempts'] == 0:
+        path = state.spool(row['uid'])
+        verified = bool(row['sha'] and row['mid'] and row['fingerprint'] and path.is_file()
+                        and digest(path.read_bytes()) == row['sha'])
+        return 'prepared' if verified else None
+    return 'importing' if row['marker'] and row['fingerprint'] else None
+
+
+def requeue_generation(state, uid):
+    """Earlier requeues of this UIDL: each new block after a requeue is a new incident."""
+    if not state.has_table('requeue_history'):  # read-only preview of a not yet migrated DB
+        return 0
+    return state.db.execute('SELECT count(*) FROM requeue_history WHERE uid=?', (uid,)).fetchone()[0]
+
+
+def requeue_token(state, row, action):
+    return digest(json.dumps(['requeue', state.get('identity'), row['uid'], row['status'], row['error'],
+                              row['attempts'], row['sha'], row['mid'], row['marker'], row['fingerprint'],
+                              action, requeue_generation(state, row['uid'])], separators=(',', ':')).encode())
+
+
+def requeue_blocked(cfg, ref=None, token=None, apply=False):
+    """Preview or requeue one reviewed gmail_search_limit block; never resends blindly."""
+    if ref is not None and (len(ref) != 16 or any(c not in '0123456789abcdef' for c in ref)):
+        raise BridgeError('invalid_message_ref')
+    if apply and (ref is None or token is None or len(token) != 64
+                  or any(c not in '0123456789abcdef' for c in token)):
+        raise BridgeError('requeue_confirmation_required')
+    if token is not None and not apply:
+        raise BridgeError('requeue_token_requires_apply')
+
+    def inspect(state):
+        rows = [r for r in state.db.execute(
+                    "SELECT * FROM messages WHERE status='blocked' AND error='gmail_search_limit'")
+                if ref is None or digest(r['uid'].encode())[:16] == ref]
+        if ref is not None and not rows:
+            raise BridgeError('requeue_candidate_not_found')
+        if ref is not None and len(rows) != 1:
+            raise BridgeError('message_ref_ambiguous')
+        return rows
+
+    state = None
+    try:
+        if not apply:
+            state = State(cfg, readonly=True)
+            state.db.execute('BEGIN')
+            messages = []
+            for r in inspect(state):
+                action = requeue_plan(state, r)
+                messages.append({'ref': digest(r['uid'].encode())[:16], 'attempts': r['attempts'],
+                                 'action': action or 'not_eligible',
+                                 'token': requeue_token(state, r, action) if action else None})
+            return {'mode': 'preview', 'count': len(messages), 'messages': messages}
+        try:
+            with lock(cfg.state/'sync.lock'):
+                state = State(cfg)
+                row = inspect(state)[0]
+                action = requeue_plan(state, row)
+                if action is None:
+                    raise BridgeError('requeue_not_eligible')
+                if token != requeue_token(state, row, action):
+                    raise BridgeError('requeue_exception_changed')
+                with state.db:
+                    state.db.execute('INSERT INTO requeue_history VALUES(?,?,?,?,?,?,?)',
+                                     (token, row['uid'], row['status'], row['error'], row['attempts'], action, time.time()))
+                    state.db.execute("UPDATE messages SET status=?, error=NULL, next_try=0 "
+                                     "WHERE uid=? AND status='blocked' AND error='gmail_search_limit'",
+                                     (action, row['uid']))
+                return {'requeued': True, 'ref': ref, 'status': action,
+                        'resend_allowed': action == 'prepared'}
+        except BridgeError as exc:
+            if str(exc) == 'already_running':
+                raise BridgeError('message_state_busy') from None
+            raise
+    finally:
+        if state:
+            state.close()
+
+
 def once(cfg, max_messages=None, force_notice=False):
     state = State(cfg)
     try:
@@ -234,6 +321,11 @@ def main():
     sub.add_parser('health', help='Read-only state and user-timer checks for monitoring')
     ignoring = sub.add_parser('ignore', help='Acknowledge one reviewed blocked message; keep source and spool')
     ignoring.add_argument('ref', help='16-character opaque ref from status output')
+    requeue = sub.add_parser('requeue', help='Preview or requeue one reviewed gmail_search_limit block; '
+                             'attempted imports only resume Gmail search, never resend')
+    requeue.add_argument('ref', nargs='?', help='16-character opaque ref from preview')
+    requeue.add_argument('--token', help='Exact requeue token from preview')
+    requeue.add_argument('--apply', action='store_true', help='Requeue this one reviewed item')
     sub.add_parser('watchdog', help='Independent stale-run check and Telegram alert')
     cleaning = sub.add_parser('cleanup', help='Preview verified source-deletion candidates; --apply explicitly deletes')
     cleaning.add_argument('--apply', action='store_true')
@@ -270,6 +362,9 @@ def main():
             return 0 if result['healthy'] else 1
         if args.command == 'ignore':
             print(json.dumps(ignore_message(cfg, args.ref)))
+            return 0
+        if args.command == 'requeue':
+            print(json.dumps(requeue_blocked(cfg, args.ref, args.token, args.apply)))
             return 0
         if args.command == 'watchdog':
             return watchdog(cfg)

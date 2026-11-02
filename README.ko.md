@@ -79,6 +79,15 @@ systemctl --user stop email2gmail.timer email2gmail-watchdog.timer
 
 `status`에서 `blocked`로 표시된 메일을 운영자가 별도로 확인해 불필요한 메일로 판단했다면 `ignore`에 16자리 `ref`를 지정합니다. `blocked`는 원래 자동 재시도되지 않으며, 이 명령은 운영자 판단을 `ignored` 종료 상태로 기록해 해당 항목을 활성 오류 경고에서 제외합니다. 기존 오류 코드와 `ref`, 원본 서버의 메일, 로컬 spool은 감사·복구용으로 보존하며 Gmail 전송이나 외부 알림도 수행하지 않습니다. 전송 결과 재확인이 끝나지 않은 `gmail_search_limit`, `blocked`가 아닌 항목, 존재하지 않거나 잘못된 `ref`, 동시에 실행 중인 수집은 변경하지 않습니다.
 
+`gmail_search_limit`로 `blocked`된 메일은 운영자가 Gmail 실제 수신 여부를 확인한 뒤 `requeue`로 한 건씩 다시 처리할 수 있습니다. 먼저 읽기 전용 preview에서 건별 `ref`, 제안 동작과 `token`을 확인합니다.
+
+```bash
+python3 -m email2gmail.cli requeue
+python3 -m email2gmail.cli requeue <ref> --token <token> --apply
+```
+
+한 번도 전송하지 않은 항목(`attempts=0`)은 spool 내용이 기록된 해시와 일치할 때만 `prepared`로 돌아가며, 전송 전에 Gmail 검색을 다시 거칩니다. 전송을 시도한 적이 있는 항목(`attempts>0`)은 Gmail에 이미 반영되었을 수 있으므로 `importing`으로 검색만 재개하고, 검색 결과가 없어도 재전송하지 않습니다. spool이 없거나 해시가 다르면 `not_eligible`이며 변경하지 않습니다. 적용은 수집 lock 안에서 최신 상태로 token을 다시 확인하고 변경 불가 `requeue_history` 기록을 남깁니다. 같은 항목이 다시 막히면 새 token이 발급되고 이전 token은 거부됩니다. Gmail 시간 예산 부족은 `blocked`가 되지 않으므로 이 명령은 검색 결과가 한 페이지를 넘어 막힌 항목에만 필요합니다.
+
 ### 모니터링 연동
 
 `health` 명령은 상태 DB를 읽기 전용으로 확인하고 두 사용자 타이머와 watchdog 실패 여부를 점검합니다. 전체 정상은 종료 코드 0, 이상은 1을 반환하며 JSON으로 `healthy`, `liveness_issues`, `queue_issues`, `scan_age_seconds`를 출력합니다. 메일 수집·삭제·Telegram 전송은 실행하지 않습니다.
@@ -121,7 +130,7 @@ python3 -m email2gmail.cli cleanup
 
 Gmail 사본이 영구삭제되어 404가 나면 해당 원본만 보존하고 다른 메일 정리는 계속합니다. 이 경우 하루 뒤 재확인하며 Telegram에 사본 없음 건수를 표시합니다. 일시 Gmail 오류·스팸/휴지통 보류는 1시간 뒤, 내용 불일치는 하루 뒤 재확인합니다. 보류 메일도 한 번의 최대 점검 건수에 포함하고 스팸·휴지통은 본문을 받기 전에 라벨로 걸러냅니다. 초기 범위 밖 `skipped`와 원래 Gmail에 있던 `existing` 메일은 자동 정리 대상에 포함하지 않습니다.
 
-형식이 비정상인 Message-ID는 첫 전송 전에 Gmail 전체 라벨을 스캔하지 않습니다. 응답 유실 재확인 시에는 최대 25건의 메타데이터에서 추적 헤더를 먼저 확인하며, 범위가 너무 넓으면 `gmail_search_limit`로 보류하고 원본 spool을 유지합니다. Gmail 호출은 실행 객체별 총 4분 예산 안에서 수행하며, 개별 요청 timeout도 남은 예산으로 제한됩니다. 예산이 모자라 확인을 끝내지 못한 메일은 보류하지 않고 `prepared`/`importing` 상태 그대로 다음 실행에서 다시 확인합니다. `gmail_search_limit` 보류 항목은 `status`의 비식별 `ref`를 기준으로 원인과 Gmail 실제 수신 여부를 확인해야 하며, DB 초기화나 무조건 재전송으로 우회하지 않습니다.
+형식이 비정상인 Message-ID는 첫 전송 전에 Gmail 전체 라벨을 스캔하지 않습니다. 응답 유실 재확인 시에는 최대 25건의 메타데이터에서 추적 헤더를 먼저 확인하며, 범위가 너무 넓으면 `gmail_search_limit`로 보류하고 원본 spool을 유지합니다. Gmail 호출은 실행 객체별 총 4분 예산 안에서 수행하며, 개별 요청 timeout도 남은 예산으로 제한됩니다. 예산이 모자라 확인을 끝내지 못한 메일은 보류하지 않고 `prepared`/`importing` 상태 그대로 다음 실행에서 다시 확인합니다. `gmail_search_limit` 보류 항목은 `status`의 비식별 `ref`를 기준으로 원인과 Gmail 실제 수신 여부를 확인해야 하며, DB 초기화나 무조건 재전송으로 우회하지 않고 `requeue`(운영 명령 참고)로 다시 처리합니다.
 
 watchdog은 상태 DB를 읽기 전용으로 열고 알림을 먼저 보냅니다. DB가 손상되거나 읽을 수 없어도 Telegram으로 오류를 알리며, 알림 간격 기록과 lock은 메일 상태 디스크와 분리된 `/run/user/<uid>/email2gmail-watchdog`에 둡니다. 네트워크·Telegram 자체 장애 또는 호스트 전체 정지는 알림을 전달할 수 없으므로 외부 heartbeat로 확인해야 합니다.
 
