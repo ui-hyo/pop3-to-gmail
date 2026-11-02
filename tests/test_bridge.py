@@ -59,14 +59,18 @@ class FakeGmail:
     def label(self): return 'CompanyLabel'
     def add_label(self, gid, label): self.labels.append((gid, label))
 
-    def find_match(self, row, label):
-        if not self.visible:
-            return None
-        for gid, raw in self.stored.items():
-            if row['marker'] == str(headers(raw).get('X-Email2Gmail-Key', '')) or (
-                    row['mid'] and message_id(raw) == row['mid'] and fingerprint(raw) == row['fingerprint']):
-                return gid
-        return None
+    def find_match(self, row, label, with_kind=False):
+        # Same preference as Gmail.find_match: this row's own marker copy first.
+        found = None, False
+        if self.visible:
+            for gid, raw in self.stored.items():
+                if row['marker'] == str(headers(raw).get('X-Email2Gmail-Key', '')):
+                    found = gid, True
+                    break
+                if row['mid'] and message_id(raw) == row['mid'] and fingerprint(raw) == row['fingerprint'] \
+                        and found[0] is None:
+                    found = gid, False
+        return found if with_kind else found[0]
 
     def import_mail(self, path, label, dated):
         data = path.read_bytes()

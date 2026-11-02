@@ -28,6 +28,7 @@ class GwsBackend:
         self.durations = {}           # op -> [seconds, ...] consumed in order
         self.imports = 0
         self.lose_import_reply = False
+        self.drop_import = False      # timeout before Gmail accepted anything
 
     def clock(self):
         return self.mono
@@ -46,6 +47,9 @@ class GwsBackend:
             self.mono += timeout
             raise subprocess.TimeoutExpired(cmd, timeout)
         self.mono += spent
+        if op == 'messages.import' and self.drop_import:
+            self.drop_import = False
+            raise subprocess.TimeoutExpired(cmd, timeout)
         result = self.respond(op, params, body, cmd)
         if op == 'messages.import' and self.lose_import_reply:
             self.lose_import_reply = False
@@ -265,6 +269,41 @@ class RequeueTests(unittest.TestCase):
         with self.assertRaisesRegex(BridgeError, 'requeue_exception_changed'):
             requeue_blocked(self.cfg, first['ref'], first['token'], apply=True)
         self.assertEqual(self.state.row('review')['status'], 'blocked')
+
+
+
+class OwnMarkerReconciliationTests(unittest.TestCase):
+    """Ambiguous-import reconciliation prefers this UIDL's own marker copy."""
+    setUp = test_bridge.BridgeTests.setUp
+    tearDown = test_bridge.BridgeTests.tearDown
+    run_cycle = GmailBudgetTests.run_cycle
+    BASE = mail()                       # one fixed MIME boundary for both copies
+    SIBLING = b'Received: from relay2.example.com\r\n' + BASE   # same Message-ID + fingerprint
+
+    def test_foreign_identical_copy_becomes_existing_and_gets_label(self):
+        backend = GwsBackend(self.cfg)
+        source = Source({'u5': self.SIBLING})
+        backend.drop_import = True
+        self.run_cycle(backend, source, 0)
+        self.assertEqual(self.state.row('u5')['status'], 'importing')
+        backend.add('g9', self.BASE)                  # e.g. a forwarded copy, no marker, no label
+        self.run_cycle(backend, source, 121)
+        row = self.state.row('u5')
+        self.assertEqual((row['status'], row['gmail_id']), ('existing', 'g9'))
+        self.assertIn('L1', backend.messages['g9'][1])
+        self.assertFalse(self.state.spool('u5').exists())
+        self.assertEqual(backend.imports, 0)
+
+    def test_own_marker_copy_wins_over_foreign_identical_copy(self):
+        backend = GwsBackend(self.cfg)
+        source = Source({'u5': self.SIBLING})
+        backend.lose_import_reply = True              # our import landed as g1
+        self.run_cycle(backend, source, 0)
+        backend.add('g9', self.BASE)                  # listed before g1
+        self.run_cycle(backend, source, 121)
+        row = self.state.row('u5')
+        self.assertEqual((row['status'], row['gmail_id']), ('imported', 'g1'))
+        self.assertEqual(backend.imports, 1)
 
 
 if __name__ == '__main__':

@@ -459,16 +459,26 @@ class Gmail:
     def raw(self, gid):
         return self.raw_with_labels(gid)[0]
 
-    def find_match(self, row, label):
+    def find_match(self, row, label, with_kind=False):
+        """Gmail copy matching this row, preferring one that carries its own marker.
+
+        A Message-ID+fingerprint match without the marker is someone else's identical
+        copy (another UIDL, or a forwarded one).  ``with_kind`` returns (id, own).
+        """
+        found = self._find_match(row, label)
+        return found if with_kind else found[0]
+
+    def _find_match(self, row, label):
         # No searchable ID and no earlier attempt: no remote side effect to reconcile.
         if not row['mid'] and row['attempts'] == 0:
-            return None
+            return None, False
         params = {'maxResults': 25, 'includeSpamTrash': True}
         if row['mid']:
             params['q'] = 'rfc822msgid:'+row['mid']
         else:
             params['labelIds'] = [label]
         data = self.call(['messages'], 'list', params)
+        foreign = None
         for item in data.get('messages', []):
             if self.time_left() < 5:
                 # Out of time for this run, not an oversized result: the caller keeps
@@ -482,13 +492,18 @@ class Gmail:
                 if row['marker'] not in markers:
                     continue
             raw = self.raw(item['id'])
-            marker_match = row['marker'] in [str(v) for v in headers(raw).get_all('X-Email2Gmail-Key', [])]
-            if (marker_match or row['mid']) and fingerprint(raw) == row['fingerprint']:
-                return item['id']
+            if fingerprint(raw) != row['fingerprint']:
+                continue
+            if row['marker'] in [str(v) for v in headers(raw).get_all('X-Email2Gmail-Key', [])]:
+                return item['id'], True
+            if row['mid'] and foreign is None:
+                foreign = item['id']
+        if foreign is not None:
+            return foreign, False
         if data.get('nextPageToken'):
             # Keep payload and surface operator action; never loop over an unbounded mailbox.
             raise BridgeError('gmail_search_limit')
-        return None
+        return None, False
 
     def add_label(self, gid, label):
         self.call(['messages'], 'modify', {'id': gid}, {'addLabelIds': [label]})
@@ -580,9 +595,15 @@ def notify(cfg, state, telegram, now, force=False):
 def deliver(cfg, state, gmail, row, label, now):
     uid = row['uid']
     if row['status'] == 'importing':
-        gid = gmail.find_match(row, label)
-        if gid:
+        gid, own = gmail.find_match(row, label, with_kind=True)
+        if gid and own:
             state.update(uid, status='imported', gmail_id=gid, error=None, delivered_at=now)
+            state.spool(uid).unlink(missing_ok=True)
+        elif gid:
+            # Only another identical copy is visible: same outcome as the prepared
+            # path (label it, keep the source as 'existing'), never resend.
+            gmail.add_label(gid, label)
+            state.update(uid, status='existing', gmail_id=gid, error=None)
             state.spool(uid).unlink(missing_ok=True)
         else:
             state.update(uid, next_try=now+120)
