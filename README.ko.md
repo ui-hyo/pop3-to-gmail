@@ -86,7 +86,7 @@ python3 -m email2gmail.cli requeue
 python3 -m email2gmail.cli requeue <ref> --token <token> --apply
 ```
 
-한 번도 전송하지 않은 항목(`attempts=0`)은 spool 내용이 기록된 해시와 일치할 때만 `prepared`로 돌아가며, 전송 전에 Gmail 검색을 다시 거칩니다. 전송을 시도한 적이 있는 항목(`attempts>0`)은 Gmail에 이미 반영되었을 수 있으므로 `importing`으로 검색만 재개하고, 검색 결과가 없어도 재전송하지 않습니다. spool이 없거나 해시가 다르면 `not_eligible`이며 변경하지 않습니다. 적용은 수집 lock 안에서 최신 상태로 token을 다시 확인하고 변경 불가 `requeue_history` 기록을 남깁니다. 같은 항목이 다시 막히면 새 token이 발급되고 이전 token은 거부됩니다. Gmail 시간 예산 부족은 `blocked`가 되지 않으므로 이 명령은 검색 결과가 한 페이지를 넘어 막힌 항목에만 필요합니다.
+한 번도 전송하지 않은 항목(`attempts=0`)은 spool 내용이 기록된 해시와 일치할 때만 `prepared`로 돌아가며, 전송 전에 Gmail 검색을 다시 거칩니다. 전송을 시도한 적이 있는 항목(`attempts>0`)은 Gmail에 이미 반영되었을 수 있으므로 `importing`으로 검색만 재개하고, 검색 결과가 없어도 재전송하지 않습니다. `attempts=0` 항목의 spool이 없거나 해시가 다를 때, 또는 `attempts>0` 항목에 기록된 marker·fingerprint가 없을 때는 `not_eligible`이며 변경하지 않습니다. 적용은 수집 lock 안에서 최신 상태로 token을 다시 확인하고 변경 불가 `requeue_history` 기록을 남깁니다. 같은 항목이 다시 막히면 새 token이 발급되고 이전 token은 거부됩니다. Gmail 시간 예산 부족은 `blocked`가 되지 않으므로 이 명령은 검색 결과가 한 페이지를 넘어 막힌 항목에만 필요합니다.
 
 ### 모니터링 연동
 

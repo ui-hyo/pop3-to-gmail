@@ -142,7 +142,9 @@ The preview lists each item's `ref`, `attempts`, proposed `action` and `token`. 
 never sent (`attempts=0`) returns to `prepared` only if its spool still matches the recorded hash,
 and Gmail is searched again before any import. An item that was sent before (`attempts>0`) may
 already be in Gmail, so it only resumes the search as `importing` and is never resent because the
-search found nothing. A missing or changed spool shows as `not_eligible` and is left alone. The
+search found nothing. An `attempts=0` item whose spool is missing or changed, or an
+`attempts>0` item without a recorded marker and fingerprint, shows as `not_eligible` and is left
+alone. The
 token is checked again under the sync lock against the current state and each apply is recorded
 in an immutable `requeue_history` table. If the same item is blocked again, the preview issues a
 new token and the old one is refused.
