@@ -441,7 +441,9 @@ class Gmail:
         data = self.call(['messages'], 'list', params)
         for item in data.get('messages', []):
             if self.time_left() < 5:
-                raise BridgeError('gmail_search_limit')
+                # Out of time for this run, not an oversized result: the caller keeps
+                # prepared/importing and searches again next run (never a resend).
+                raise GmailError('cycle_time_budget', rejected=True)
             if not row['mid']:
                 metadata = self.call(['messages'], 'get', {'id': item['id'], 'format': 'metadata',
                                      'metadataHeaders': ['X-Email2Gmail-Key']})
