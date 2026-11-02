@@ -1,9 +1,10 @@
+import sqlite3
 import time
 import unittest
 from unittest.mock import patch
 
 from email2gmail.cleanup import cleanup
-from email2gmail.core import BridgeError, GmailError, Config, sync
+from email2gmail.core import BridgeError, GmailError, Config, notify, sync
 import test_bridge
 from test_bridge import FakeGmail, Source, mail
 
@@ -220,3 +221,61 @@ class CleanupTests(unittest.TestCase):
              patch('email2gmail.cli.notify'), patch('email2gmail.cleanup.cleanup') as clean, redirect_stdout(StringIO()):
             once(self.cfg)
         clean.assert_not_called()
+
+
+class UnconfirmedDeleteTests(unittest.TestCase):
+    """A fresh listing that still shows the source resolves a stale pending delete."""
+    setUp = test_bridge.BridgeTests.setUp
+    tearDown = test_bridge.BridgeTests.tearDown
+
+    def unconfirmed(self):
+        self.cfg.source_cleanup_enabled = True
+        self.gmail = CleanupGmail()
+        self.source = CleanupSource({'a': mail()})
+        sync(self.cfg, self.state, self.gmail, self.source, self.now)
+        self.later = self.now + 8*86400
+        self.source.quit_fail = True                     # QUIT failed: DELE never committed
+        with self.assertRaisesRegex(BridgeError, 'cleanup_commit_unconfirmed'):
+            cleanup(self.cfg, self.state, apply=True, gmail=self.gmail, source=self.source, now=self.later)
+        self.assertEqual(self.state.row('a')['cleanup_state'], 'pending')
+        self.source = CleanupSource(dict(self.source.messages))   # new session, source still there
+
+    def test_present_source_clears_pending_and_keeps_history(self):
+        self.unconfirmed()
+        self.gmail.remote_labels = ['TRASH']                 # re-verification holds the source
+        self.later += 3601
+        result = cleanup(self.cfg, self.state, apply=True, gmail=self.gmail, source=self.source, now=self.later)
+        row = self.state.row('a')
+        self.assertEqual((row['cleanup_state'], row['cleanup_issue'], result['pending_resolved']), (None, 'spam_trash', 1))
+        self.assertIsNone(row['source_deleted_at'])
+        self.assertEqual(self.source.deletions, [])
+        history = self.state.db.execute('SELECT * FROM cleanup_unconfirmed_resolutions').fetchall()
+        self.assertEqual([(h['uid'], h['resolution']) for h in history], [('a', 'source_present_after_unconfirmed_delete')])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.state.db.execute('DELETE FROM cleanup_unconfirmed_resolutions')
+        self.state.db.rollback()
+        sent = []
+        class Telegram:
+            def send(self, text): sent.append(text); return 1
+        notify(self.cfg, self.state, Telegram(), self.later, force=True)
+        self.assertIn('정상 동작', sent[0])                 # no lasting "delete unconfirmed" alert
+
+    def test_present_source_can_be_restaged_and_confirmed(self):
+        self.unconfirmed()
+        self.later += 3601
+        result = cleanup(self.cfg, self.state, apply=True, gmail=self.gmail, source=self.source, now=self.later)
+        self.assertEqual((result['pending_resolved'], result['deleted']), (1, 1))
+        self.assertEqual(self.state.row('a')['cleanup_state'], 'confirmed')
+
+    def test_reused_or_resized_uidl_keeps_pending_alert(self):
+        self.unconfirmed()
+        self.source = CleanupSource({'a': mail(body='a different, longer reused message')})
+        self.later += 3601
+        result = cleanup(self.cfg, self.state, apply=True, gmail=self.gmail, source=self.source, now=self.later)
+        self.assertEqual((self.state.row('a')['cleanup_state'], result['pending_unresolved']), ('pending', 1))
+        self.assertEqual(self.source.deletions, [])
+
+    def test_preview_never_resolves_pending(self):
+        self.unconfirmed()
+        cleanup(self.cfg, self.state, gmail=self.gmail, source=self.source, now=self.later+3601)
+        self.assertEqual(self.state.row('a')['cleanup_state'], 'pending')

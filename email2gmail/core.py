@@ -182,6 +182,14 @@ class State:
             BEFORE UPDATE ON requeue_history BEGIN SELECT RAISE(ABORT, 'immutable_requeue_history'); END;
           CREATE TRIGGER IF NOT EXISTS requeue_history_no_delete
             BEFORE DELETE ON requeue_history BEGIN SELECT RAISE(ABORT, 'immutable_requeue_history'); END;
+          CREATE TABLE IF NOT EXISTS cleanup_unconfirmed_resolutions(
+            uid TEXT NOT NULL, gmail_id TEXT, fingerprint TEXT, size INTEGER NOT NULL,
+            resolution TEXT NOT NULL, resolved_at REAL NOT NULL
+          );
+          CREATE TRIGGER IF NOT EXISTS cleanup_unconfirmed_resolutions_no_update
+            BEFORE UPDATE ON cleanup_unconfirmed_resolutions BEGIN SELECT RAISE(ABORT, 'immutable_cleanup_history'); END;
+          CREATE TRIGGER IF NOT EXISTS cleanup_unconfirmed_resolutions_no_delete
+            BEFORE DELETE ON cleanup_unconfirmed_resolutions BEGIN SELECT RAISE(ABORT, 'immutable_cleanup_history'); END;
         ''')
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(messages)')}
         for name, kind in [('cleanup_state', 'TEXT'), ('source_deleted_at', 'REAL'),
@@ -252,6 +260,17 @@ class State:
         return self.db.execute(
             "SELECT count(*) FROM messages WHERE status!='ignored' "
             'AND (error IS NOT NULL OR source_issue IS NOT NULL)').fetchone()[0]
+
+    def resolve_unconfirmed_delete(self, row, now):
+        """A fresh POP session still lists this exact UIDL and size: the earlier
+        DELE was never committed.  Keep an immutable record of the attempt and
+        return the row to normal re-verification."""
+        with self.db:
+            self.db.execute('INSERT INTO cleanup_unconfirmed_resolutions VALUES(?,?,?,?,?,?)',
+                            (row['uid'], row['gmail_id'], row['fingerprint'], row['size'],
+                             'source_present_after_unconfirmed_delete', now))
+            self.db.execute("UPDATE messages SET cleanup_state=NULL WHERE uid=? AND cleanup_state='pending'",
+                            (row['uid'],))
 
 
 class PopSource:

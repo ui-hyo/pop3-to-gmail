@@ -189,8 +189,10 @@ candidates. With `source_cleanup_enabled = true`, the tool checks once an hour
 
 The delete intent is written to the database first, POP `DELE` is staged, and only a successful
 `QUIT` confirms it. If the `QUIT` reply is lost, nothing is assumed: the next listing shows whether
-the message is gone. An interrupted run closes the connection without `QUIT`, so the server rolls
-back the staged deletions.
+the message is gone. If that listing still has the same UIDL with the same size, the delete was not
+committed; the attempt is recorded and the message goes through verification again. A changed size
+may mean a reused UIDL, so the delete stays unconfirmed and keeps alerting. An interrupted run
+closes the connection without `QUIT`, so the server rolls back the staged deletions.
 
 ## Limitations
 

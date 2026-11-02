@@ -27,7 +27,8 @@ def cleanup(cfg, state: State, *, apply=False, gmail=None, source=None, now=None
         result = {'mode': 'apply' if apply else 'preview', 'retention_days': cfg.source_retention_days,
                   'eligible': 0, 'too_recent': 0, 'held_spam_trash': 0, 'mismatch': 0,
                   'absent': 0, 'deleted': 0, 'pending_commit': 0, 'gmail_missing': 0,
-                  'gmail_unavailable': 0, 'deferred': 0, 'checked': 0}
+                  'gmail_unavailable': 0, 'deferred': 0, 'checked': 0,
+                  'pending_resolved': 0, 'pending_unresolved': 0}
         def hold(uid, issue, delay=3600):
             if apply:
                 state.update(uid, cleanup_issue=issue, cleanup_next_try=now+delay)
@@ -42,6 +43,15 @@ def cleanup(cfg, state: State, *, apply=False, gmail=None, source=None, now=None
         rows = state.db.execute("SELECT * FROM messages WHERE status='imported' AND gmail_id IS NOT NULL ORDER BY cleanup_next_try, rowid").fetchall()
         for row in rows:
             uid = row['uid']
+            if row['cleanup_state'] == 'pending' and uid in available:
+                # Same UIDL and size in a new session proves the earlier DELE was not
+                # committed.  A size change or source incident may be UIDL reuse after
+                # a committed delete, so that stays pending (and alerting).
+                if apply and available[uid][1] == row['size'] and row['source_issue'] is None:
+                    state.resolve_unconfirmed_delete(row, now)
+                    result['pending_resolved'] += 1
+                else:
+                    result['pending_unresolved'] += 1
             if uid not in available:
                 result['absent'] += 1
                 if apply and row['cleanup_state'] == 'pending':
