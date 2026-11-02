@@ -255,6 +255,32 @@ class BridgeTests(unittest.TestCase):
         self.assertNotIn('hello', output[0])
         self.assertEqual(self.state.get('last_telegram_id'), 42)
 
+    NOTICE_KEYS = ('last_notice', 'last_summary', 'last_telegram_id', 'telegram_error', 'last_alert')
+
+    def test_failed_notice_record_changes_nothing(self):
+        self.state.set('last_error', 'gmail_timeout')          # makes the notice an alert
+        self.state.set('telegram_error', 'telegram_http_500')
+        before = {k: self.state.get(k) for k in self.NOTICE_KEYS}
+        self.state.db.execute("CREATE TEMP TRIGGER fail_alert BEFORE INSERT ON meta "
+                              "WHEN NEW.key='last_alert' BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+        class FakeTelegram:
+            def send(self, text): return 42
+        import sqlite3
+        with self.assertRaises(sqlite3.IntegrityError):
+            notify(self.cfg, self.state, FakeTelegram(), self.now, force=True)
+        self.state.db.execute('DROP TRIGGER fail_alert')
+        self.assertEqual({k: self.state.get(k) for k in self.NOTICE_KEYS}, before)   # all or nothing
+
+    def test_notice_is_recorded_in_one_transaction(self):
+        self.state.set('last_error', 'gmail_timeout')
+        class FakeTelegram:
+            def send(self, text): return 42
+        with patch.object(self.state, 'set', side_effect=AssertionError('separate commit')):
+            notify(self.cfg, self.state, FakeTelegram(), self.now, force=True)
+        self.assertEqual({k: self.state.get(k) for k in self.NOTICE_KEYS},
+                         {'last_notice': self.now, 'last_summary': self.now, 'last_telegram_id': 42,
+                          'telegram_error': None, 'last_alert': self.now})
+
     def test_secret_parser_colon_and_shell_syntax_never_evaluated(self):
         path = self.cfg.state/'input.env'
         path.write_text('EMAIL2GMAIL_POP_USER: company@example.com\nEMAIL2GMAIL_POP_PASSWORD="$(touch /tmp/nope) # !"\nIGNORED=ignore\n')

@@ -214,6 +214,12 @@ class State:
         with self.db:
             self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (key, json.dumps(value)))
 
+    def set_many(self, values):
+        """Record several meta keys in one transaction (all or nothing)."""
+        with self.db:
+            self.db.executemany('INSERT OR REPLACE INTO meta VALUES(?,?)',
+                                [(k, json.dumps(v)) for k, v in values.items()])
+
     def update(self, uid, **values):
         with self.db:
             self.db.execute('UPDATE messages SET '+', '.join(k+'=?' for k in values)+' WHERE uid=?',
@@ -654,12 +660,12 @@ def notify(cfg, state, telegram, now, force=False):
     if counts.get('blocked') or item_errors:
         text += '\n개별 메일 오류: 로컬 status에서 확인 필요'
     mid = telegram.send(text)
-    state.set('last_notice', now)
-    state.set('last_summary', now)
-    state.set('last_telegram_id', mid)
-    state.set('telegram_error', None)
+    # One commit right after the send.  A crash or lost reply between send and
+    # commit can still repeat this message (Telegram has no idempotency key).
+    record = {'last_notice': now, 'last_summary': now, 'last_telegram_id': mid, 'telegram_error': None}
     if alert:
-        state.set('last_alert', now)
+        record['last_alert'] = now
+    state.set_many(record)
 
 
 def deliver(cfg, state, gmail, row, label, now):
