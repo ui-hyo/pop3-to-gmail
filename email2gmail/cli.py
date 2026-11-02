@@ -237,6 +237,8 @@ def once(cfg, max_messages=None, force_notice=False):
     try:
         with lock(cfg.state/'sync.lock'):
             state.set('last_attempt', time.time())
+            with contextlib.suppress(OSError):
+                state.prune_delivered_spool()  # same write lock as delivery
             source = None
             try:
                 gmail = Gmail(cfg)

@@ -261,6 +261,36 @@ class State:
             "SELECT count(*) FROM messages WHERE status!='ignored' "
             'AND (error IS NOT NULL OR source_issue IS NOT NULL)').fetchone()[0]
 
+    # Only clean completion may lose its leftover spool.  Everything else may need
+    # the payload for recovery: errors, source incidents, any cleanup issue
+    # (gmail_missing, fingerprint_mismatch, gmail_unavailable, spam_trash, ...),
+    # a delete that is pending or only reconciled by absence, a source that
+    # vanished without our confirmed delete, and an unconfirmed-delete history.
+    PRUNABLE_SPOOL = """
+      SELECT m.uid FROM messages m
+      WHERE m.status IN ('imported','existing') AND m.gmail_id IS NOT NULL
+        AND m.error IS NULL AND m.source_issue IS NULL AND m.cleanup_issue IS NULL
+        AND ((m.present=1 AND m.cleanup_state IS NULL AND m.source_deleted_at IS NULL)
+             OR (m.cleanup_state='confirmed' AND m.source_deleted_at IS NOT NULL))
+        AND NOT EXISTS (SELECT 1 FROM cleanup_unconfirmed_resolutions r WHERE r.uid=m.uid)"""
+
+    def prune_delivered_spool(self):
+        """Remove leftover spool files of cleanly delivered rows only (see PRUNABLE_SPOOL).
+
+        A crash between the imported/existing commit and the unlink leaves mail
+        content behind.  Unknown files and temp files are never touched.
+        """
+        files = {p.name for p in (self.root/'spool').glob('*.eml')}
+        if not files:
+            return 0
+        removed = 0
+        for row in self.db.execute(self.PRUNABLE_SPOOL).fetchall():
+            path = self.spool(row['uid'])
+            if path.name in files:
+                path.unlink(missing_ok=True)
+                removed += 1
+        return removed
+
     def resolve_unconfirmed_delete(self, row, now):
         """A fresh POP session still lists this exact UIDL and size: the earlier
         DELE was never committed.  Keep an immutable record of the attempt and

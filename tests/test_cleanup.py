@@ -1,3 +1,6 @@
+import contextlib
+import io
+from pathlib import Path
 import sqlite3
 import time
 import unittest
@@ -279,3 +282,95 @@ class UnconfirmedDeleteTests(unittest.TestCase):
         self.unconfirmed()
         cleanup(self.cfg, self.state, gmail=self.gmail, source=self.source, now=self.later+3601)
         self.assertEqual(self.state.row('a')['cleanup_state'], 'pending')
+
+
+class DeliveredSpoolPruneTests(unittest.TestCase):
+    """once() removes only leftover spool of cleanly delivered rows, under the sync lock."""
+    setUp = test_bridge.BridgeTests.setUp
+    tearDown = test_bridge.BridgeTests.tearDown
+
+    def once_offline(self):
+        from email2gmail.cli import once
+        with patch('email2gmail.cli.Gmail'), patch('email2gmail.cli.PopSource'), \
+             patch('email2gmail.cli.recover'), patch('email2gmail.cli.sync'), \
+             patch('email2gmail.cli.notify'), contextlib.redirect_stdout(io.StringIO()):
+            return once(self.cfg)
+
+    def crash_before_unlink(self, uid, gmail, source):
+        real = Path.unlink
+        target = self.state.spool(uid)
+        def crash(path, *args, **kwargs):
+            if path == target:
+                raise SystemExit('simulated crash before spool unlink')
+            return real(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', crash), self.assertRaises(SystemExit):
+            sync(self.cfg, self.state, gmail, source, self.now)
+        self.assertEqual(self.state.row(uid)['status'], 'imported')
+        self.assertTrue(target.is_file())
+
+    def test_crash_before_unlink_leaves_spool_that_next_run_removes(self):
+        self.crash_before_unlink('a', self.gmail, Source({'a': mail()}))
+        self.once_offline()
+        self.assertFalse(self.state.spool('a').exists())
+
+    def test_prune_keeps_spool_for_known_missing_copy_mismatch_and_pending_delete(self):
+        gmail = CleanupGmail()
+        for uid in ['missing', 'mismatch', 'pending']:
+            source = CleanupSource({uid: mail(mid=uid+'@example.com')})
+            self.crash_before_unlink(uid, gmail, source)
+            later = self.now+8*86400
+            if uid == 'missing':
+                with patch.object(gmail, 'current_labels', side_effect=GmailError('gmail_http_404')):
+                    cleanup(self.cfg, self.state, apply=True, gmail=gmail, source=source, now=later)
+                self.assertEqual(self.state.row(uid)['cleanup_issue'], 'gmail_missing')
+                self.state.snapshot([], self.cfg, later+1)     # source vanishes independently
+            elif uid == 'mismatch':
+                gmail.stored[self.state.row(uid)['gmail_id']] += b'changed body\r\n'
+                cleanup(self.cfg, self.state, apply=True, gmail=gmail, source=source, now=later)
+                self.assertEqual(self.state.row(uid)['cleanup_issue'], 'fingerprint_mismatch')
+            else:
+                source.quit_fail = True
+                with self.assertRaisesRegex(BridgeError, 'cleanup_commit_unconfirmed'):
+                    cleanup(self.cfg, self.state, apply=True, gmail=gmail, source=source, now=later)
+                self.assertEqual(self.state.row(uid)['cleanup_state'], 'pending')
+        self.assertEqual(self.state.prune_delivered_spool(), 0,
+                         'cleanup incidents and pending deletes are not clean completion')
+        for uid in ['missing', 'mismatch', 'pending']:
+            self.assertTrue(self.state.spool(uid).is_file())
+
+    def test_prune_exclusions_are_enumerated(self):
+        """Every recovery-relevant state keeps its spool; only clean completion is pruned."""
+        keep = {
+            'issue_src': dict(status='imported', source_issue='uidl_reappeared_or_changed'),
+            'error': dict(status='imported', error='x'),
+            'no_gmail_id': dict(status='imported', gmail_id=None),
+            'c_missing': dict(status='imported', cleanup_issue='gmail_missing'),
+            'c_mismatch': dict(status='imported', cleanup_issue='fingerprint_mismatch'),
+            'c_unavail': dict(status='imported', cleanup_issue='gmail_unavailable'),
+            'c_spam': dict(status='imported', cleanup_issue='spam_trash'),
+            'pending': dict(status='imported', cleanup_state='pending'),
+            'conf_absent': dict(status='imported', cleanup_state='confirmed_absent', source_deleted_at=self.now),
+            'not_present': dict(status='imported', present=0),
+            'resolved': dict(status='imported'),
+            'blocked': dict(status='blocked'), 'ignored': dict(status='ignored'),
+            'prepared': dict(status='prepared'), 'importing': dict(status='importing'),
+            'skipped': dict(status='skipped'), 'new': dict(status='new'),
+        }
+        prune = {'clean_imported': dict(status='imported'), 'clean_existing': dict(status='existing'),
+                 'confirmed': dict(status='imported', cleanup_state='confirmed', present=0,
+                                   source_deleted_at=self.now)}
+        rows = {**keep, **prune}
+        self.state.snapshot([(i, uid, 10) for i, uid in enumerate(rows, 1)], self.cfg, self.now)
+        for uid, values in rows.items():
+            self.state.update(uid, **{'gmail_id': 'g-'+uid, 'fingerprint': 'f', **values})
+            self.state.spool(uid).write_bytes(b'payload')
+        with self.state.db:
+            self.state.db.execute('INSERT INTO cleanup_unconfirmed_resolutions VALUES(?,?,?,?,?,?)',
+                                  ('resolved', 'g-resolved', 'f', 10, 'source_present_after_unconfirmed_delete', self.now))
+        stray = self.cfg.state/'spool'/('0'*64+'.eml')
+        stray.write_bytes(b'no row')
+        temp = self.cfg.state/'spool'/'.tmp-partial'
+        temp.write_bytes(b'partial')
+        self.assertEqual(self.state.prune_delivered_spool(), len(prune))
+        self.assertEqual({u for u in rows if self.state.spool(u).exists()}, set(keep))
+        self.assertTrue(stray.exists() and temp.exists())
