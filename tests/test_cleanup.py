@@ -2,12 +2,15 @@ import contextlib
 import io
 from pathlib import Path
 import sqlite3
+import subprocess
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from email2gmail.cleanup import cleanup
-from email2gmail.core import BridgeError, GmailError, Config, notify, sync
+from email2gmail.core import (BridgeError, GmailError, Config, PopSource, fingerprint, header_boundary_ambiguous, notify,
+                              sync)
 import test_bridge
 from test_bridge import FakeGmail, Source, mail
 
@@ -348,6 +351,7 @@ class DeliveredSpoolPruneTests(unittest.TestCase):
             'c_mismatch': dict(status='imported', cleanup_issue='fingerprint_mismatch'),
             'c_unavail': dict(status='imported', cleanup_issue='gmail_unavailable'),
             'c_spam': dict(status='imported', cleanup_issue='spam_trash'),
+            'c_header': dict(status='imported', cleanup_issue='header_boundary_ambiguous'),
             'pending': dict(status='imported', cleanup_state='pending'),
             'conf_absent': dict(status='imported', cleanup_state='confirmed_absent', source_deleted_at=self.now),
             'not_present': dict(status='imported', present=0),
@@ -374,3 +378,92 @@ class DeliveredSpoolPruneTests(unittest.TestCase):
         self.assertEqual(self.state.prune_delivered_spool(), len(prune))
         self.assertEqual({u for u in rows if self.state.spool(u).exists()}, set(keep))
         self.assertTrue(stray.exists() and temp.exists())
+
+
+class HeaderBoundaryTests(unittest.TestCase):
+    """Mail whose header block fingerprint() may not fully cover is never auto-deleted."""
+    setUp = test_bridge.BridgeTests.setUp
+    tearDown = test_bridge.BridgeTests.tearDown
+    MALFORMED = (b'From: a@example.com\r\nSubject: s\r\nBROKEN LINE WITHOUT COLON\r\n'
+                 b'X-Original: AAAA\r\n\r\nbody\r\n')
+
+    def deliver(self, raw):
+        self.cfg.source_cleanup_enabled = True
+        self.gmail = CleanupGmail()
+        self.source = CleanupSource({'a': raw, 'ok': mail('ok@example.com')})
+        sync(self.cfg, self.state, self.gmail, self.source, self.now)
+        return self.now + 8*86400
+
+    def test_boundary_detection(self):
+        self.assertTrue(header_boundary_ambiguous(self.MALFORMED))
+        self.assertTrue(header_boundary_ambiguous(b'From sender Fri Sep 11\r\nSubject: s\r\n\r\nbody'))
+        self.assertTrue(header_boundary_ambiguous(b'Subject : spaced colon\r\nFrom: a@b\r\n\r\nbody'))
+        self.assertFalse(header_boundary_ambiguous(mail()))
+        self.assertFalse(header_boundary_ambiguous(b'Subject: folded\r\n  continuation\r\n\r\nx\r\nNOT: header\r\n'))
+
+    def test_ambiguous_mail_is_held_without_alert_and_normal_mail_still_cleans(self):
+        from email2gmail.cli import health
+        later = self.deliver(self.MALFORMED)
+        result = cleanup(self.cfg, self.state, apply=True, gmail=self.gmail, source=self.source, now=later)
+        self.assertEqual(self.source.deletions, [2])                    # only 'ok'
+        self.assertEqual(result['held_header_ambiguous'], 1)
+        self.assertEqual(self.state.row('a')['cleanup_issue'], 'header_boundary_ambiguous')
+        systemctl = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1 if 'is-failed' in argv else 0)
+        with patch('email2gmail.cli.subprocess.run', side_effect=systemctl):
+            self.assertEqual(health(self.cfg)['queue_issues'], [])
+        sent = []
+        class Telegram:
+            def send(self, text): sent.append(text); return 1
+        notify(self.cfg, self.state, Telegram(), later, force=True)
+        self.assertIn('헤더 경계 불명확 1건', sent[0])
+        self.assertIn('정상 동작', sent[0])
+
+    def test_bare_cr_header_boundary_is_held_even_when_visible_fingerprint_matches(self):
+        raw = (b'From: source@example.com\r\nSubject: fixture\rBROKEN\r\n'
+               b'X-Original: AAAA\r\n\r\nbody\r\n')
+        pop = object.__new__(PopSource)              # real POP retrieval keeps the bare CR
+        pop.max_bytes = 100000
+        pop.p = SimpleNamespace(file=io.BytesIO(raw+b'.\r\n'), _putcmd=lambda x: None, _getresp=lambda: None)
+        self.assertEqual(pop.retrieve(1), raw)
+        gmail = CleanupGmail()
+        source = CleanupSource({'review': raw})
+        sync(self.cfg, self.state, gmail, source, self.now)
+        gid = self.state.row('review')['gmail_id']
+        remote = gmail.stored[gid]
+        changed = remote.replace(b'X-Original: AAAA', b'X-Original: BBBB')
+        self.assertNotEqual(remote, changed)
+        self.assertEqual(fingerprint(remote), fingerprint(changed))
+        gmail.stored[gid] = changed
+        self.assertTrue(header_boundary_ambiguous(raw))
+        self.assertTrue(header_boundary_ambiguous(changed))
+        cleanup(self.cfg, self.state, apply=True, gmail=gmail, source=source, now=self.now+8*86400)
+        self.assertEqual(source.deletions, [], 'different remote bytes must preserve the source')
+        self.assertEqual(self.state.row('review')['cleanup_issue'], 'header_boundary_ambiguous')
+
+    def test_every_line_boundary_the_parser_honours_is_ambiguous_in_headers(self):
+        head = b'From: a@example.com\r\nSubject: s'
+        tail = b'X-Original: AAAA\r\n\r\nbody\r\n'
+        # The parser honours LF and lone CR (byte sweep: only 0x0a and 0x0d hide bytes);
+        # other C0 controls are held conservatively.
+        for sep in (b'\r', b'\r\r\n', b'\n\r', b'\x0b', b'\x0c', b'\x1c', b'\x1d', b'\x1e'):
+            with self.subTest(sep=sep):
+                self.assertTrue(header_boundary_ambiguous(head + sep + b'BROKEN\r\n' + tail))
+        # NUL or other control bytes inside header lines are also outside the verified grammar.
+        self.assertTrue(header_boundary_ambiguous(b'Subject: a\x00b\r\n\r\nbody\r\n'))
+
+    def test_byte_sweep_every_hiding_separator_is_ambiguous(self):
+        for b in range(256):
+            make = lambda v: (b'From: a@x\r\nSubject: s' + bytes([b]) + b'BROKEN\r\nX-Original: ' + v
+                              + b'\r\n\r\nbody\r\n')
+            if fingerprint(make(b'AAAA')) == fingerprint(make(b'BBBB')):
+                with self.subTest(byte=b):
+                    self.assertTrue(header_boundary_ambiguous(make(b'AAAA')))
+
+    def test_normal_mime_headers_are_not_overblocked(self):
+        variants = [mail(), mail(mid=None), mail(body='BODY WITHOUT A COLON'),
+                    b'Subject: folded\r\n\tcontinuation\r\nX-Test: value\r\n\r\nbody\r\n',
+                    # 8-bit UTF-8 header (contains 0x85-range bytes) and a lone CR in the body.
+                    b'Subject: =?UTF-8?B?7ZWc6riA?=\r\nX-Raw: \xed\x95\x85\xea\xb8\x80 8bit\r\n\r\nbody\rwith CR\r\n']
+        for value in variants:
+            self.assertFalse(header_boundary_ambiguous(value))
+            self.assertFalse(header_boundary_ambiguous(value.replace(b'\r\n', b'\n')))

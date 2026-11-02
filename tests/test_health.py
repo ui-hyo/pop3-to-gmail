@@ -73,6 +73,8 @@ class HealthTests(unittest.TestCase):
         self.cfg.source_cleanup_enabled = True
         self.message(status='imported', cleanup_issue='spam_trash')
         self.assertTrue(health(self.cfg)['healthy'])
+        self.state.update('private-uid', cleanup_issue='header_boundary_ambiguous')
+        self.assertTrue(health(self.cfg)['healthy'])
         self.state.update('private-uid', cleanup_issue='gmail_missing')
         self.assertIn('cleanup_issues=1', health(self.cfg)['issues'])
         self.state.update('private-uid', present=0)

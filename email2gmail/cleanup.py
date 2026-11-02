@@ -4,7 +4,8 @@ from __future__ import annotations
 import contextlib
 import time
 
-from .core import BridgeError, Gmail, GmailError, PopSource, State, fingerprint, headers, prepare, safe_error
+from .core import (BridgeError, Gmail, GmailError, PopSource, State, fingerprint, header_boundary_ambiguous, headers,
+                   prepare, safe_error)
 
 
 def cleanup(cfg, state: State, *, apply=False, gmail=None, source=None, now=None):
@@ -28,7 +29,7 @@ def cleanup(cfg, state: State, *, apply=False, gmail=None, source=None, now=None
                   'eligible': 0, 'too_recent': 0, 'held_spam_trash': 0, 'mismatch': 0,
                   'absent': 0, 'deleted': 0, 'pending_commit': 0, 'gmail_missing': 0,
                   'gmail_unavailable': 0, 'deferred': 0, 'checked': 0,
-                  'pending_resolved': 0, 'pending_unresolved': 0}
+                  'pending_resolved': 0, 'pending_unresolved': 0, 'held_header_ambiguous': 0}
         def hold(uid, issue, delay=3600):
             if apply:
                 state.update(uid, cleanup_issue=issue, cleanup_next_try=now+delay)
@@ -85,6 +86,11 @@ def cleanup(cfg, state: State, *, apply=False, gmail=None, source=None, now=None
             if source.uid_at(n) != uid:
                 raise BridgeError('cleanup_uidl_changed')
             original = source.retrieve(n)
+            if header_boundary_ambiguous(original) or header_boundary_ambiguous(remote):
+                # fingerprint() may not cover every header byte (see header_boundary_ambiguous).
+                result['held_header_ambiguous'] += 1
+                hold(uid, 'header_boundary_ambiguous', 86400)
+                continue
             payload, _, marker = prepare(original, cfg.identity, uid)
             expected = fingerprint(payload)
             marker_ok = marker in [str(v) for v in headers(remote).get_all('X-Email2Gmail-Key', [])]

@@ -186,6 +186,11 @@ candidates. With `source_cleanup_enabled = true`, the tool checks once an hour
 - the current source message, the Gmail copy and the recorded fingerprint all match, and the trace
   header is present;
 - the Gmail copy is not in Spam or Trash, because Gmail can expire those folders.
+- both copies have an unambiguous header block: no header line the parser would reject and no
+  lone CR or other control bytes before the first blank line. Otherwise part of the headers could
+  escape the fingerprint, so the source is kept as `header_boundary_ambiguous` and rechecked daily.
+  Like a Spam/Trash hold, this does not make `health` unhealthy; the Telegram summary shows the
+  count.
 
 The delete intent is written to the database first, POP `DELE` is staged, and only a successful
 `QUIT` confirms it. If the `QUIT` reply is lost, nothing is assumed: the next listing shows whether

@@ -8,7 +8,8 @@ from pathlib import Path
 import subprocess
 import time
 
-from .core import BridgeError, Config, Gmail, PopSource, State, Telegram, atomic_write, digest, lock, notify, recover, safe_error, sync
+from .core import (RETAINED_HOLDS, BridgeError, Config, Gmail, PopSource, State, Telegram, atomic_write, digest, lock,
+                   notify, recover, safe_error, sync)
 
 
 def status(cfg):
@@ -68,8 +69,10 @@ def health(cfg):
         if cfg.source_cleanup_enabled:
             if state.get('cleanup_error'):
                 queue_issues.append('cleanup_error')
-            held = state.db.execute(
-                "SELECT count(*) FROM messages WHERE present=1 AND cleanup_issue IS NOT NULL AND cleanup_issue!='spam_trash'").fetchone()[0]
+            # Retained holds keep the source safely; they show in status, not as problems.
+            held = sum(n for issue, n in state.db.execute(
+                'SELECT cleanup_issue, count(*) FROM messages WHERE present=1 AND cleanup_issue IS NOT NULL '
+                'GROUP BY cleanup_issue') if issue not in RETAINED_HOLDS)
             pending = state.db.execute(
                 "SELECT count(*) FROM messages WHERE cleanup_state='pending'").fetchone()[0]
             if held:

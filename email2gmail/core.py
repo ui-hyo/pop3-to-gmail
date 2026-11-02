@@ -414,6 +414,44 @@ def fingerprint(raw):
     return digest(json.dumps(stable, ensure_ascii=False).encode() + b'\0' + body)
 
 
+# A header line the stdlib parser accepts: "name:" (no space before the colon) or a
+# folded continuation.  Anything else ends the parsed header block early.
+_HEADER_LINE = re.compile(rb'[\x21-\x39\x3b-\x7e]+:|[ \t]')
+# Control bytes other than TAB/LF, searched after CRLF->LF, so every CR left is a
+# lone CR.  The parser treats a lone CR as a line break while fingerprint() splits
+# only on LF, so any of these in the header region can hide header bytes.
+_HEADER_CONTROL = re.compile(rb'[\x00-\x08\x0b-\x1f\x7f]')
+# Cleanup holds that keep the source safely and need no operator alert.
+RETAINED_HOLDS = frozenset({'spam_trash', 'header_boundary_ambiguous'})
+
+
+def header_boundary_ambiguous(raw):
+    """True when bytes before the first blank line could escape fingerprint().
+
+    fingerprint() covers parsed headers plus the bytes after the first blank
+    line; a line the parser rejects ends its header block, and a line break the
+    parser sees but fingerprint() does not (lone CR) splits it differently.
+    Besides the line grammar, the number of header fields must match what the
+    parser reports, so an unforeseen interpretation difference is also held.
+    Such mail is never auto-deleted.
+    """
+    head = raw.replace(b'\r\n', b'\n').partition(b'\n\n')[0]
+    if _HEADER_CONTROL.search(head):
+        return True
+    lines = [line for line in head.split(b'\n') if line]
+    if any(not _HEADER_LINE.match(line) for line in lines):
+        return True
+    fields = sum(1 for line in lines if line[:1] not in (b' ', b'\t'))
+    try:
+        try:
+            parsed = len(list(headers(raw).items()))
+        except (OverflowError, ValueError):
+            parsed = len(BytesHeaderParser(policy=email.policy.compat32).parsebytes(raw).items())
+    except Exception:
+        return True
+    return parsed != fields
+
+
 def prepare(raw, identity, uid):
     # Preserve all original bytes, adding only trace and (if absent/invalid) identity headers.
     marker = digest((identity+'\0'+uid+'\0'+digest(raw)).encode())
@@ -585,7 +623,7 @@ def notify(cfg, state, telegram, now, force=False):
     cleanup_result = state.get('last_cleanup_result', {}) if cfg.source_cleanup_enabled else {}
     cleanup_issues = dict(state.db.execute("SELECT cleanup_issue,count(*) FROM messages WHERE present=1 AND cleanup_issue IS NOT NULL GROUP BY cleanup_issue")) if cfg.source_cleanup_enabled else {}
     cleanup_pending = state.db.execute("SELECT count(*) FROM messages WHERE cleanup_state='pending'").fetchone()[0] if cfg.source_cleanup_enabled else 0
-    alert = bool(error or cleanup_result.get('mismatch') or any(k != 'spam_trash' for k in cleanup_issues) or cleanup_pending or item_errors or counts.get('blocked') or counts.get('importing'))
+    alert = bool(error or cleanup_result.get('mismatch') or any(k not in RETAINED_HOLDS for k in cleanup_issues) or cleanup_pending or item_errors or counts.get('blocked') or counts.get('importing'))
     due = force or (alert and now-state.get('last_alert', 0) >= 3600) or (
         delivered and now-last_summary >= cfg.summary_seconds) or now-last_notice >= cfg.heartbeat_seconds
     if not due:
@@ -605,6 +643,8 @@ def notify(cfg, state, telegram, now, force=False):
                  f'검증 불일치 {cleanup_result.get("mismatch", 0)}건 · 삭제 결과 미확정 {cleanup_pending}건')
     if cleanup_issues.get('gmail_missing'):
         text += f'\n서버 원본 보존: Gmail 사본 없음 {cleanup_issues["gmail_missing"]}건'
+    if cleanup_issues.get('header_boundary_ambiguous'):
+        text += f'\n서버 원본 보존: 헤더 경계 불명확 {cleanup_issues["header_boundary_ambiguous"]}건 (자동 정리 제외)'
     if cleanup_issues.get('gmail_unavailable'):
         text += f'\nGmail 확인 재시도 대기 {cleanup_issues["gmail_unavailable"]}건'
     if error:
